@@ -73,6 +73,24 @@ $script:CollectDir   = 'C:\Collect'
 $script:Version      = '1.0'
 $script:GHVersionUrl = 'https://raw.githubusercontent.com/Zerinhox33/Collect-Free/main/version.txt'
 
+# Detecta ponteiro Git LFS ou corpo de erro (HTML/JSON) salvo no lugar do binario.
+function Test-BadDownload {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $true }
+        if ((Get-Item -LiteralPath $Path).Length -le 0) { return $true }
+        $fs  = [IO.File]::OpenRead($Path)
+        $buf = New-Object 'byte[]' 128
+        $n   = $fs.Read($buf, 0, 128)
+        $fs.Dispose()
+        if ($n -le 0) { return $true }
+        $head = [Text.Encoding]::ASCII.GetString($buf, 0, $n)
+        if ($head -like 'version https://git-lfs.github.com/spec*') { return $true }
+        if ($head -match '^\s*(<!DOCTYPE|<html|\{"message")') { return $true }
+        return $false
+    } catch { return $false }
+}
+
 # ─── DOWNLOAD HÍBRIDO ─────────────────────────────────────────────────────────
 function Invoke-HybridDownload {
     param(
@@ -85,8 +103,12 @@ function Invoke-HybridDownload {
 
     # Se ja existe, pula
     if (Test-Path -LiteralPath $dest) {
-        Write-Log "Ja existe: $FileName"
-        return
+        if (-not (Test-BadDownload $dest)) {
+            Unblock-File -LiteralPath $dest -ErrorAction SilentlyContinue
+            Write-Log "Ja existe: $FileName"
+            return
+        }
+        Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
     }
 
     # 1. Tenta Winget
@@ -104,18 +126,19 @@ function Invoke-HybridDownload {
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor 12288
 
+        $enc = [Uri]::EscapeDataString($FileName)
         if ($ReleaseTag) {
-            $url = "$script:GHRelease/$ReleaseTag/$([Uri]::EscapeDataString($FileName))"
+            Invoke-WebRequest -Uri "$script:GHRelease/$ReleaseTag/$enc" -OutFile $dest -UseBasicParsing -ErrorAction Stop | Out-Null
         } else {
-            $url = "$script:GHBase/$([Uri]::EscapeDataString($FileName))"
+            # repo PUBLICO sem LFS -> raw serve o binario real direto
+            Invoke-WebRequest -Uri "$script:GHBase/$enc" -OutFile $dest -UseBasicParsing -ErrorAction Stop | Out-Null
         }
 
-        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -ErrorAction Stop | Out-Null
-
-        if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 0) {
+        if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 0 -and -not (Test-BadDownload $dest)) {
+            Unblock-File -LiteralPath $dest -ErrorAction SilentlyContinue
             Write-Log "GitHub OK: $FileName"
         } else {
-            Write-Log "Falha ao baixar: $FileName" 'WARN'
+            Write-Log "Falha ao baixar (conteudo invalido): $FileName" 'WARN'
         }
     } catch {
         Write-Log "Erro GitHub ($FileName): $($_.Exception.Message)" 'WARN'
@@ -194,6 +217,7 @@ function Invoke-BootstrapDownloads {
         Write-Center 'Extraindo Visual C++ Runtimes...' 'Gray'
         try {
             Expand-Archive -LiteralPath $vcZip -DestinationPath $script:CollectDir -Force -ErrorAction Stop
+            Get-ChildItem -LiteralPath $script:CollectDir -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
             Write-Log 'Visual-C-Runtimes extraido.'
         } catch { Write-Log "Falha ao extrair Runtimes: $($_.Exception.Message)" 'WARN' }
     }
@@ -551,28 +575,17 @@ function Invoke-MemoryOpt {
         Write-Log "DisablePagingExecutive: PULADO (RAM: ${ramGB}GB < 16GB -- risco de instabilidade)" 'WARN'
     }
 
-    # Prefetch e SysMain -- apenas desativa se houver SSD como disco do sistema
-    # Detecta SSD ou NVMe (alguns drivers reportam 'Unspecified' para NVMe)
-    $physDisks = Get-PhysicalDisk -ErrorAction SilentlyContinue
-    $hasSSD = $null -ne ($physDisks | Where-Object {
-        $_.MediaType -eq 'SSD' -or $_.BusType -eq 'NVMe' -or
-        ($_.MediaType -eq 'Unspecified' -and $_.BusType -match 'NVMe|SATA')
-    })
-    if ($hasSSD) {
-        Write-Log 'SSD detectado - desativando Prefetch e SysMain.'
-        # MemoryCompression desativada apenas em sistemas com 16GB+ — em <16GB COMPRIME E AJUDA
-        if ($ramGB -ge 16) {
-            Disable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue
-            Write-Log "MemoryCompression desativada (RAM: ${ramGB}GB >= 16GB)"
-        } else {
-            Write-Log "MemoryCompression PRESERVADA (RAM: ${ramGB}GB < 16GB -- ajuda em RAM baixa)"
-        }
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' 'EnablePrefetcher' 0
-        Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters' 'EnableSuperfetch' 0
-        & "$env:SystemRoot\system32\sc.exe" stop   'SysMain' 2>&1 | Out-Null
-        & "$env:SystemRoot\system32\sc.exe" config 'SysMain' start= disabled 2>&1 | Out-Null
+    # ── PROTECAO (padrao Pro, vale para os 3 scripts) ──
+    # Prefetch/SysMain sao INTOCAVEIS: NAO parar/desabilitar o servico SysMain
+    # nem setar EnablePrefetcher/EnableSuperfetch=0; NAO apagar a pasta Prefetch.
+    # Servicos protegidos no projeto: dps, diagtrack, pcasvc, sysmain.
+
+    # MemoryCompression: desativa apenas com RAM >= 16GB -- em <16GB comprime e ajuda
+    if ($ramGB -ge 16) {
+        Disable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue
+        Write-Log "MemoryCompression desativada (RAM: ${ramGB}GB >= 16GB)"
     } else {
-        Write-Log 'HDD detectado - Prefetch e SysMain preservados para performance.' 'WARN'
+        Write-Log "MemoryCompression PRESERVADA (RAM: ${ramGB}GB < 16GB -- ajuda em RAM baixa)"
     }
 
     $memMB = (Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum / 1MB
@@ -799,6 +812,9 @@ function Invoke-ImportNvidiaProfile {
     if ((Test-Path $zipPath) -and -not $alreadyExtracted) {
         try {
             Expand-Archive -LiteralPath $zipPath -DestinationPath 'C:\Collect' -Force -ErrorAction Stop
+            $candidateFolders | Where-Object { Test-Path $_ } | ForEach-Object {
+                Get-ChildItem -LiteralPath $_ -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+            }
             Write-Log 'nvidiaInspector.zip extraido com sucesso.'
         } catch {
             Write-Log "Falha ao extrair nvidiaInspector.zip: $($_.Exception.Message)" 'WARN'
