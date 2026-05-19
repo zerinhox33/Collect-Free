@@ -88,7 +88,7 @@ function Test-BadDownload {
         if ($head -like 'version https://git-lfs.github.com/spec*') { return $true }
         if ($head -match '^\s*(<!DOCTYPE|<html|\{"message")') { return $true }
         return $false
-    } catch { return $false }
+    } catch { return $true }   # fail-closed: arquivo ilegivel/travado = trata como ruim (re-baixa)
 }
 
 # ─── DOWNLOAD HÍBRIDO ─────────────────────────────────────────────────────────
@@ -565,7 +565,6 @@ function Invoke-StorageOpt {
 function Invoke-MemoryOpt {
     Write-Log 'Otimizando Memoria...'
 
-    Disable-MMAgent -PageCombining  -ErrorAction SilentlyContinue
     Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'LargeSystemCache' 0
     $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1GB)
     if ($ramGB -ge 16) {
@@ -580,12 +579,14 @@ function Invoke-MemoryOpt {
     # nem setar EnablePrefetcher/EnableSuperfetch=0; NAO apagar a pasta Prefetch.
     # Servicos protegidos no projeto: dps, diagtrack, pcasvc, sysmain.
 
-    # MemoryCompression: desativa apenas com RAM >= 16GB -- em <16GB comprime e ajuda
+    # MemoryCompression + PageCombining: desativa apenas com RAM >= 16GB.
+    # Em <16GB ambos economizam RAM e ajudam -- preservados.
     if ($ramGB -ge 16) {
         Disable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue
-        Write-Log "MemoryCompression desativada (RAM: ${ramGB}GB >= 16GB)"
+        Disable-MMAgent -PageCombining     -ErrorAction SilentlyContinue
+        Write-Log "MemoryCompression + PageCombining desativados (RAM: ${ramGB}GB >= 16GB)"
     } else {
-        Write-Log "MemoryCompression PRESERVADA (RAM: ${ramGB}GB < 16GB -- ajuda em RAM baixa)"
+        Write-Log "MemoryCompression + PageCombining PRESERVADOS (RAM: ${ramGB}GB < 16GB -- ajudam em RAM baixa)"
     }
 
     $memMB = (Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum / 1MB
@@ -656,7 +657,7 @@ function Invoke-NetworkTweaks {
     & netsh int tcp set heuristics       disabled                          2>&1 | Out-Null
     & netsh int tcp set global rsc=disabled                                2>&1 | Out-Null
     & netsh int tcp set global netdma=disabled                             2>&1 | Out-Null
-    & netsh int tcp set supplemental internet congestionprovider=newreno   2>&1 | Out-Null
+    & netsh int tcp set supplemental template=internet congestionprovider=newreno 2>&1 | Out-Null
 
     # Preferencia IPv4 sobre IPv6 (valor 32 = desativa IPv6 em interfaces nao-tunnel)
     Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\services\TCPIP6\Parameters'          'DisabledComponents'  32
@@ -742,6 +743,10 @@ function Invoke-TasksCleanup {
 function Invoke-RestorePoint {
     Write-Log 'Criando ponto de restauracao...'
     try {
+        # Protecao do Sistema vem DESLIGADA por padrao no Win10/11 -> habilitar antes
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+        # Remove o limite de 1 ponto a cada 24h (senao o 2o checkpoint do dia falha)
+        Set-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' 'SystemRestorePointCreationFrequency' 0
         Checkpoint-Computer -Description 'Collect Free Restore Point' -RestorePointType MODIFY_SETTINGS
         Write-Log 'Ponto de restauracao criado.'
     } catch {
@@ -997,7 +1002,14 @@ try {
                 Invoke-BackupRegistry
                 Invoke-RestorePoint
                 Write-Host ''
-                foreach ($cat in $script:Categories | Where-Object { $_.CK -ne 'R' -and $_.F }) {
+                # Power Plan PRIMEIRO: Invoke-CPUOpt grava em scheme_current via
+                # powercfg; ativar o plano Collect depois descartaria esses
+                # ajustes. Importar/ativar o plano antes resolve.
+                Write-Center '-- Power Plan (Collect Free) --' 'DarkCyan'
+                Invoke-PowerPlan
+                $script:Done['13'] = $true
+                Write-Host ''
+                foreach ($cat in $script:Categories | Where-Object { $_.F -and $_.CK -ne '13' }) {
                     Write-Center "-- $($cat.Name) --" 'DarkCyan'
                     & $cat.F
                     $script:Done[$cat.CK] = $true
